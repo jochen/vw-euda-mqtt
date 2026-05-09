@@ -1,0 +1,3 @@
+weconnect==0.60.11
+paho-mqtt>=1.6,<3
+python-dotenv>=1.0
