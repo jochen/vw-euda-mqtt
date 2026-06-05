@@ -1,0 +1,17 @@
+[Unit]
+Description=VW EU Data Act → MQTT daemon (Home Assistant Discovery)
+Documentation=https://github.com/jochen/vw-euda-mqtt
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pi/projects/weconnect-to-mqtt
+ExecStart=/home/pi/projects/weconnect-to-mqtt/venv/bin/python euda_service.py
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

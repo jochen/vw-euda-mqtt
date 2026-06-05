@@ -1,0 +1,5 @@
+# EU Data Act → MQTT service (euda_service.py / euda_probe.py)
+aiohttp>=3.9
+paho-mqtt>=2.1,<3
+aiomqtt>=2.0
+python-dotenv>=1.0
