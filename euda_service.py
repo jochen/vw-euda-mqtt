@@ -42,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from euda import api as euda_api  # noqa: E402
 from euda.api import ApiError, AuthError, EudaApiClient  # noqa: E402
 from euda.data import Dataset  # noqa: E402
-from euda.mqtt import build_messages, build_soc_live_messages  # noqa: E402
+from euda.mqtt import build_messages, soc_live_discovery, soc_live_state  # noqa: E402
 
 log = logging.getLogger("euda_service")
 
@@ -205,6 +205,11 @@ class Config:
         self.soc_live_subtopic = os.environ.get("SOC_LIVE_SUBTOPIC", "soc_live")
         self.interp_interval_s = float(os.environ.get("INTERP_INTERVAL_S", "60"))
         self.charge_efficiency = float(os.environ.get("CHARGE_EFFICIENCY", "1.0"))
+        # soc_live feeds evcc → keep it non-retained so a stale value can't
+        # linger and make evcc charge on after this service stops.
+        self.soc_live_retain = os.environ.get("SOC_LIVE_RETAIN", "false").lower() in (
+            "1", "true", "yes",
+        )
 
     def evcc_topic(self, field: str) -> str:
         return f"{self.evcc_base_topic}/loadpoints/{self.evcc_loadpoint}/{field}"
@@ -495,7 +500,7 @@ async def interpolation_task(
 ) -> None:
     """Periodic SOC interpolation tick; publishes soc_live when changed."""
     interval = cfg.interp_interval_s
-    first_publish = True
+    discovery_sent = False
 
     while not stop.is_set():
         try:
@@ -510,12 +515,6 @@ async def interpolation_task(
             log.debug("interpolation: noch kein realer VW-SOC — überspringe")
             continue
 
-        # Only publish if value changed (or first time).
-        rounded = round(soc_live, 1)
-        if not first_publish and hub.last_published_soc_live == rounded:
-            log.debug("interpolation: soc_live=%.1f%% unverändert — kein Publish", rounded)
-            continue
-
         mqtt_client = mqtt_client_ref[0] if mqtt_client_ref else None
         if mqtt_client is None:
             log.debug("interpolation: MQTT-Client noch nicht bereit")
@@ -526,14 +525,22 @@ async def interpolation_task(
             log.debug("interpolation: VIN noch nicht bekannt")
             continue
 
+        rounded = round(soc_live, 1)
+        changed = hub.last_published_soc_live != rounded
         try:
-            msgs = build_soc_live_messages(
-                vin, cfg.base_topic, cfg.soc_live_subtopic, rounded
-            )
+            msgs = []
+            if not discovery_sent:
+                msgs.append(soc_live_discovery(vin, cfg.base_topic, cfg.soc_live_subtopic))
+            # Republish the (non-retained) state EVERY tick so evcc's timeout
+            # always sees a fresh value; the moment we stop, evcc invalidates it
+            # instead of charging on against a frozen retained SOC.
+            msgs.append(soc_live_state(
+                cfg.base_topic, cfg.soc_live_subtopic, rounded, cfg.soc_live_retain))
             await _async_publish(mqtt_client, msgs)
+            discovery_sent = True
             hub.last_published_soc_live = rounded
-            first_publish = False
-            log.info(
+            log.log(
+                logging.INFO if changed else logging.DEBUG,
                 "soc_live=%.1f%% (charging=%s, anchor_soc=%s, energy=%.0f Wh)",
                 rounded, hub.charging,
                 f"{hub.anchor_soc:.1f}%" if hub.anchor_soc is not None else "None",

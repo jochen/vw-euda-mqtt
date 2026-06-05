@@ -274,7 +274,9 @@ def test_soc_live_messages_structure():
     assert config_msg.topic == expected_config_topic, (
         f"Config topic mismatch: {config_msg.topic!r}"
     )
-    assert config_msg.retain is True
+    assert config_msg.retain is True   # discovery config stays retained
+    # State is NON-retained by default (evcc fail-safe).
+    assert state_msg.retain is False
 
     config_payload = json.loads(config_msg.payload)
     assert config_payload["device_class"] == "battery"
@@ -291,8 +293,14 @@ def test_soc_live_messages_structure():
     assert state_msg.topic == expected_state_topic, (
         f"State topic mismatch: {state_msg.topic!r}"
     )
-    assert state_msg.retain is True
     assert state_msg.payload == "67.3", f"State payload mismatch: {state_msg.payload!r}"
+
+
+def test_soc_live_state_retain_flag():
+    """soc_live state is non-retained by default, retained only when requested."""
+    from euda.mqtt import soc_live_state
+    assert soc_live_state("ohm/car/id3", "soc_live", 50.0).retain is False
+    assert soc_live_state("ohm/car/id3", "soc_live", 50.0, retain=True).retain is True
 
 
 def test_soc_live_state_payload_format():
@@ -326,6 +334,7 @@ def _run_all():
         test_efficiency_factor,
         test_soc_live_messages_structure,
         test_soc_live_state_payload_format,
+        test_soc_live_state_retain_flag,
     ]
     passed = 0
     failed = 0

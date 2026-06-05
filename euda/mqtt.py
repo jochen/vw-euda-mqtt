@@ -64,28 +64,41 @@ def _device(vin: str) -> dict:
     }
 
 
-def build_soc_live_messages(vin: str, base_topic: str, subtopic: str, soc_live: float) -> list[MqttMessage]:
-    """Return [discovery_config_msg, state_msg] for the interpolated live-SOC sensor.
-
-    The discovery config is retained so HA picks it up after restarts.
-    The state message is also retained so HA shows the last value immediately.
-    """
-    device = _device(vin)
+def soc_live_discovery(vin: str, base_topic: str, subtopic: str) -> MqttMessage:
+    """HA discovery config for the interpolated live-SOC sensor (retained)."""
     object_id = f"vw_id3_{vin.lower()}_soc_live"
-    state_topic = f"{base_topic}/{subtopic}"
-    config_topic = f"homeassistant/sensor/{object_id}/config"
     ha_config = {
         "name": "SOC (live)",
         "unique_id": object_id,
         "device_class": "battery",
         "unit_of_measurement": "%",
         "state_class": "measurement",
-        "state_topic": state_topic,
-        "device": device,
+        "state_topic": f"{base_topic}/{subtopic}",
+        "device": _device(vin),
     }
+    return MqttMessage(f"homeassistant/sensor/{object_id}/config",
+                       json.dumps(ha_config), retain=True)
+
+
+def soc_live_state(base_topic: str, subtopic: str, soc_live: float,
+                   retain: bool = False) -> MqttMessage:
+    """State message for the live SOC.
+
+    Defaults to retain=False: this is the topic evcc consumes for charging
+    decisions, so it must NOT linger on the broker. A non-retained value that
+    is republished every interpolation tick lets evcc's own ``timeout`` flag the
+    SOC as stale (and stop trusting it) the moment this service stops publishing
+    — instead of charging on against a frozen retained value.
+    """
+    return MqttMessage(f"{base_topic}/{subtopic}", f"{soc_live:.1f}", retain=retain)
+
+
+def build_soc_live_messages(vin: str, base_topic: str, subtopic: str,
+                            soc_live: float, retain_state: bool = False) -> list[MqttMessage]:
+    """[discovery_config (retained), state] for the live-SOC sensor."""
     return [
-        MqttMessage(config_topic, json.dumps(ha_config), retain=True),
-        MqttMessage(state_topic, f"{soc_live:.1f}", retain=True),
+        soc_live_discovery(vin, base_topic, subtopic),
+        soc_live_state(base_topic, subtopic, soc_live, retain_state),
     ]
 
 

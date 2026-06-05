@@ -191,8 +191,11 @@ journalctl --user -u vw-euda-mqtt -f
 
 ## evcc integration
 
-evcc can use `ohm/car/id3/soc` directly via a custom MQTT vehicle. To get the
-interpolated value while charging, point it at `ohm/car/id3/soc_live` instead.
+Point evcc at **`ohm/car/id3/soc_live`** via a custom MQTT vehicle. This topic
+is **non-retained** and republished every `INTERP_INTERVAL_S` (60 s), so a short
+evcc `timeout` reliably flags the SOC as stale if this service stops — evcc then
+won't keep charging against a frozen value. Use the live topic, not the raw
+`soc` (which is retained for HA display and would linger after an outage).
 
 ```yaml
 mqtt:
@@ -202,15 +205,15 @@ vehicles:
   - name: id3
     type: custom
     title: VW ID.3
-    capacity: 58            # kWh (ID.3 Pro)
+    capacity: 58              # kWh (ID.3 Pro)
     soc:
       source: mqtt
-      topic: ohm/car/id3/soc   # or ohm/car/id3/soc_live for the interpolated value
-      timeout: 90m
+      topic: ohm/car/id3/soc_live   # non-retained, refreshed every 60 s
+      timeout: 10m                  # short: soc_live is fresh; older ⇒ service down
 ```
 
 No extra publishing is required — MQTT is pub/sub and the daemon already
-publishes both topics.
+publishes the topic.
 
 ---
 
