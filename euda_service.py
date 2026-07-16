@@ -54,6 +54,8 @@ NO_CONTENT = "_no_content_found.zip"
 DATASET_INTERVAL = 15 * 60       # seconds
 POST_DATASET_BUFFER = 45         # seconds
 RETRY_INTERVAL = 60              # seconds (not-ready / transient)
+AUTH_RETRY_INITIAL = 300         # seconds (AuthError: VW sperrt Accounts bei
+AUTH_RETRY_MAX = 4 * 3600        #   Login-Stürmen — exponentiell zurückhalten)
 MIN_INTERVAL = 30                # seconds
 MQTT_RECONNECT_DELAY = 10        # seconds (initial backoff on MqttError)
 MQTT_RECONNECT_MAX = 120         # seconds (max backoff)
@@ -256,11 +258,27 @@ async def vw_poll_task(
         if COOKIE_FILE.exists():
             client._logged_in = True  # noqa: SLF001  reuse; re-login on 401/403
 
-        vin, identifier = await _resolve_target(client, cfg)
+        # Startup-Login darf den Service nicht crashen (systemd-Restart-Loop
+        # = Login-Sturm): bei AuthError mit Backoff weiterprobieren.
+        auth_backoff = AUTH_RETRY_INITIAL
+        vin = identifier = None
+        while vin is None and not stop.is_set():
+            try:
+                vin, identifier = await _resolve_target(client, cfg)
+            except AuthError as e:
+                log.error("Auth fehlgeschlagen: %s — Retry in %ds", e, auth_backoff)
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=auth_backoff)
+                except asyncio.TimeoutError:
+                    pass
+                auth_backoff = min(auth_backoff * 2, AUTH_RETRY_MAX)
+        if vin is None:
+            return
         jar.save(COOKIE_FILE)
         hub.vin = vin
         log.info("Ziel: VIN %s, Identifier %s", vin, identifier)
 
+        auth_backoff = AUTH_RETRY_INITIAL
         while not stop.is_set():
             delay = RETRY_INTERVAL
             try:
@@ -269,8 +287,11 @@ async def vw_poll_task(
                     client, cfg, vin, identifier, state, hub, mqtt_client
                 )
                 jar.save(COOKIE_FILE)
+                auth_backoff = AUTH_RETRY_INITIAL
             except AuthError as e:
-                log.error("Auth fehlgeschlagen: %s — Retry in %ds", e, RETRY_INTERVAL)
+                delay = auth_backoff
+                auth_backoff = min(auth_backoff * 2, AUTH_RETRY_MAX)
+                log.error("Auth fehlgeschlagen: %s — Retry in %ds", e, delay)
             except ApiError as e:
                 log.warning("API-Fehler: %s — Retry in %ds", e, RETRY_INTERVAL)
             except Exception:  # noqa: BLE001

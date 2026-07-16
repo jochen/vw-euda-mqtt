@@ -10,7 +10,7 @@ import re
 import uuid
 import zipfile
 from html.parser import HTMLParser
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import aiohttp
 
@@ -273,12 +273,29 @@ class EudaApiClient:
                 raise AuthError(err or f"Login rejected (HTTP {resp.status})")
         _LOGGER.debug("login step4: landed on %s", landing)
 
+        # 5. Since ~2026-07-12 the IdP interjects consent interstitials (e.g.
+        #    /consent/marketing/...) after the credentials POST. The OIDC
+        #    continuation lives in the page's ?callback= query parameter;
+        #    following it skips the question and completes the flow.
+        for _ in range(3):
+            parsed = urlparse(landing)
+            if "/consent/" not in parsed.path:
+                break
+            callback = parse_qs(parsed.query).get("callback", [None])[0]
+            if not callback:
+                raise AuthError(f"Consent page without callback URL (at {landing})")
+            _LOGGER.debug("login step5: consent interstitial -> follow %s", callback)
+            async with await self._get(callback) as resp:
+                landing = str(resp.url)
+                await resp.read()
+            _LOGGER.debug("login step5: landed on %s", landing)
+
         # Positively confirm success: a completed flow lands back on the portal
         # host (via /services/callbacklogin). Bad credentials re-render the
         # identity sign-in page (URL still on identity.vwgroup.io/signin-service).
         portal_host = urlparse(BASE_URL).netloc
         if "signin-service" in landing or "/error" in landing:
-            raise AuthError("Login failed - check email and password")
+            raise AuthError(f"Login failed - check email and password (ended at {landing})")
         if urlparse(landing).netloc != portal_host:
             raise AuthError(f"Login did not complete (ended at {landing})")
 
