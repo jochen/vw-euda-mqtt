@@ -59,6 +59,8 @@ AUTH_RETRY_MAX = 4 * 3600        #   Login-Stürmen — exponentiell zurückhalt
 MIN_INTERVAL = 30                # seconds
 MQTT_RECONNECT_DELAY = 10        # seconds (initial backoff on MqttError)
 MQTT_RECONNECT_MAX = 120         # seconds (max backoff)
+MQTT_KEEPALIVE_INTERVAL = 30     # seconds (availability ping — surfaces dead links)
+AVAILABILITY_SUBTOPIC = "availability"
 
 
 # ---------------------------------------------------------------------------
@@ -587,19 +589,34 @@ async def mqtt_task(
     backoff = MQTT_RECONNECT_DELAY
     while not stop.is_set():
         try:
+            availability = f"{cfg.base_topic}/{AVAILABILITY_SUBTOPIC}"
             async with aiomqtt.Client(
                 hostname=cfg.broker,
                 port=cfg.port,
                 username=cfg.mqtt_user,
                 password=cfg.mqtt_password,
                 identifier="vweuda-publisher",
+                will=aiomqtt.Will(availability, payload="offline", retain=True),
             ) as client:
                 backoff = MQTT_RECONNECT_DELAY
                 mqtt_client_ref.clear()
                 mqtt_client_ref.append(client)
                 log.info("MQTT publisher verbunden mit %s:%d", cfg.broker, cfg.port)
-                # Hold the connection open until stop or error.
-                await stop.wait()
+                # Ping the availability topic instead of parking on stop.wait():
+                # aiomqtt only raises MqttError from an *active* call, so a link
+                # that dies while this task idles goes unnoticed, the dead client
+                # stays in mqtt_client_ref, and every later publish fails with
+                # "client is not currently connected" until the daemon restarts.
+                while not stop.is_set():
+                    await client.publish(availability, payload="online", retain=True)
+                    try:
+                        await asyncio.wait_for(
+                            stop.wait(), timeout=MQTT_KEEPALIVE_INTERVAL
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                # Clean shutdown: the will only fires on an unexpected drop.
+                await client.publish(availability, payload="offline", retain=True)
 
         except aiomqtt.MqttError as e:
             mqtt_client_ref.clear()
