@@ -15,23 +15,15 @@ from pathlib import Path
 # Make sure the project root is on sys.path when run directly.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from euda_service import Hub, _handle_evcc_message, _re_anchor, interpolate_soc
+from euda_service import Hub, _handle_evcc_message
 from euda.mqtt import build_soc_live_messages
+from euda.soc_estimator import SocEstimator
 
 
 CAPACITY_KWH = 58.0
 EFFICIENCY = 1.0
-
-
-# ---------------------------------------------------------------------------
-# Helper
-# ---------------------------------------------------------------------------
-
-def _make_hub(**kwargs) -> Hub:
-    h = Hub()
-    for k, v in kwargs.items():
-        setattr(h, k, v)
-    return h
+H = 3600.0
+T0 = 1_795_000_000.0  # arbitrary epoch base
 
 
 class _FakeCfg:
@@ -43,213 +35,167 @@ class _FakeCfg:
         return f"{self.evcc_base_topic}/loadpoints/{self.evcc_loadpoint}/{field}"
 
 
+def _est(**kw) -> SocEstimator:
+    return SocEstimator(capacity_kwh=CAPACITY_KWH, efficiency=kw.pop("efficiency", EFFICIENCY),
+                        stale_after_s=kw.pop("stale_after_s", 2700.0))
+
+
+def _charge(est: SocEstimator, t_start: float, t_end: float, kw: float, step: float = 30.0,
+            session_start_wh: float = 0.0) -> float:
+    """Simulate evcc publishing chargedEnergy every ``step`` s at ``kw``."""
+    t, wh = t_start, session_start_wh
+    while t <= t_end:
+        est.evcc_energy(t, wh)
+        t += step
+        wh += kw * 1000.0 * step / 3600.0
+    return wh
+
+
 # ---------------------------------------------------------------------------
-# Test 1: basic interpolation math
+# Basic math
 # ---------------------------------------------------------------------------
 
 def test_basic_interpolation():
-    """anchor_soc=50%, 0→2900 Wh charged → soc_live should be 55.0%."""
-    hub = _make_hub(
-        last_real_soc=50.0,
-        charging=True,
-        charged_energy_wh=2900.0,
-        anchor_soc=50.0,
-        anchor_energy_wh=0.0,
-    )
-    result = interpolate_soc(hub, CAPACITY_KWH, EFFICIENCY)
-    assert result is not None
-    assert abs(result - 55.0) < 1e-6, f"Expected 55.0, got {result}"
+    """50 % + 2.9 kWh on a 58 kWh pack → 55 %."""
+    est = _est()
+    est.evcc_energy(T0, 0.0)
+    est.portal_ok(T0)
+    est.vw_reading(50.0, T0)
+    est.evcc_energy(T0 + 600, 2900.0)
+    assert abs(est.estimate(T0 + 600) - 55.0) < 1e-6
 
-
-def test_basic_interpolation_partial():
-    """anchor_soc=30%, 1000 Wh added → soc_live ~31.72%."""
-    hub = _make_hub(
-        last_real_soc=30.0,
-        charging=True,
-        charged_energy_wh=1000.0,
-        anchor_soc=30.0,
-        anchor_energy_wh=0.0,
-    )
-    expected = 30.0 + 1000.0 / (58000.0) * 100.0
-    result = interpolate_soc(hub, CAPACITY_KWH, EFFICIENCY)
-    assert result is not None
-    assert abs(result - expected) < 1e-6, f"Expected {expected}, got {result}"
-
-
-# ---------------------------------------------------------------------------
-# Test 2: clamp to 100
-# ---------------------------------------------------------------------------
 
 def test_clamp_to_100():
-    """Very large chargedEnergy should not push soc_live above 100%."""
-    hub = _make_hub(
-        last_real_soc=95.0,
-        charging=True,
-        charged_energy_wh=99999.0,
-        anchor_soc=95.0,
-        anchor_energy_wh=0.0,
-    )
-    result = interpolate_soc(hub, CAPACITY_KWH, EFFICIENCY)
-    assert result is not None
-    assert result == 100.0, f"Expected 100.0 (clamped), got {result}"
+    est = _est()
+    est.evcc_energy(T0, 0.0)
+    est.portal_ok(T0)
+    est.vw_reading(95.0, T0)
+    est.evcc_energy(T0 + 60, 99999.0)
+    assert est.estimate(T0 + 60) == 100.0
 
-
-def test_clamp_floor_is_anchor_soc():
-    """Result is never below anchor_soc even with negative delta (e.g. rounding)."""
-    hub = _make_hub(
-        last_real_soc=60.0,
-        charging=True,
-        charged_energy_wh=5.0,   # tiny delta — rounds to anchor_soc floor
-        anchor_soc=60.0,
-        anchor_energy_wh=5.0,    # same → delta=0
-    )
-    result = interpolate_soc(hub, CAPACITY_KWH, EFFICIENCY)
-    assert result is not None
-    assert result >= 60.0, f"Expected >= 60.0 (anchor floor), got {result}"
-
-
-# ---------------------------------------------------------------------------
-# Test 3: not-charging path → return last_real_soc
-# ---------------------------------------------------------------------------
-
-def test_not_charging_returns_last_real_soc():
-    hub = _make_hub(
-        last_real_soc=72.5,
-        charging=False,
-        charged_energy_wh=1234.0,
-        anchor_soc=70.0,
-        anchor_energy_wh=100.0,
-    )
-    result = interpolate_soc(hub, CAPACITY_KWH, EFFICIENCY)
-    assert result == 72.5, f"Expected 72.5, got {result}"
-
-
-def test_no_real_soc_returns_none():
-    hub = _make_hub(
-        last_real_soc=None,
-        charging=True,
-        charged_energy_wh=500.0,
-        anchor_soc=50.0,
-        anchor_energy_wh=0.0,
-    )
-    result = interpolate_soc(hub, CAPACITY_KWH, EFFICIENCY)
-    assert result is None, f"Expected None, got {result}"
-
-
-# ---------------------------------------------------------------------------
-# Test 4: re-anchor on new real VW SOC
-# ---------------------------------------------------------------------------
-
-def test_reanchor_on_new_real_soc():
-    """After _re_anchor with a new VW SOC, interpolation uses the new anchor."""
-    hub = _make_hub(
-        last_real_soc=60.0,
-        charging=True,
-        charged_energy_wh=2000.0,
-        anchor_soc=50.0,
-        anchor_energy_wh=0.0,
-    )
-    # Simulate a new real SOC arriving while charging.
-    hub.last_real_soc = 62.0
-    _re_anchor(hub, 62.0)
-    # After re-anchor, anchor_energy_wh = 2000 Wh. No delta → soc_live = 62.0.
-    result = interpolate_soc(hub, CAPACITY_KWH, EFFICIENCY)
-    assert result is not None
-    assert abs(result - 62.0) < 1e-6, f"Expected 62.0 after re-anchor, got {result}"
-
-
-# ---------------------------------------------------------------------------
-# Test 5: chargedEnergy reset (session reset)
-# ---------------------------------------------------------------------------
-
-def test_charged_energy_reset_via_handle():
-    """When chargedEnergy drops below anchor_energy_wh while charging,
-    _handle_evcc_message should re-anchor anchor_energy_wh to the new lower value."""
-    hub = _make_hub(
-        last_real_soc=55.0,
-        charging=True,
-        charged_energy_wh=3000.0,
-        anchor_soc=55.0,
-        anchor_energy_wh=3000.0,
-    )
-    cfg = _FakeCfg()
-    # Simulate chargedEnergy dropping to 500 (session reset).
-    _handle_evcc_message(hub, cfg.evcc_topic("chargedEnergy"), "500", cfg)
-    assert hub.charged_energy_wh == 500.0
-    # anchor_energy_wh should have been reset to 500.
-    assert hub.anchor_energy_wh == 500.0
-    # anchor_soc reset to last_real_soc.
-    assert hub.anchor_soc == 55.0
-
-
-def test_charged_energy_advances_normally():
-    """Normal energy increase should NOT trigger a re-anchor."""
-    hub = _make_hub(
-        last_real_soc=50.0,
-        charging=True,
-        charged_energy_wh=1000.0,
-        anchor_soc=50.0,
-        anchor_energy_wh=0.0,
-    )
-    cfg = _FakeCfg()
-    _handle_evcc_message(hub, cfg.evcc_topic("chargedEnergy"), "2000", cfg)
-    assert hub.charged_energy_wh == 2000.0
-    assert hub.anchor_energy_wh == 0.0   # unchanged
-
-
-# ---------------------------------------------------------------------------
-# Test 6: charging start edge (false → true)
-# ---------------------------------------------------------------------------
-
-def test_charging_start_triggers_reanchor():
-    """Transition from charging=False to charging=True should re-anchor."""
-    hub = _make_hub(
-        last_real_soc=48.0,
-        charging=False,
-        charged_energy_wh=500.0,
-        anchor_soc=None,
-        anchor_energy_wh=None,
-    )
-    cfg = _FakeCfg()
-    _handle_evcc_message(hub, cfg.evcc_topic("charging"), "true", cfg)
-    assert hub.charging is True
-    assert hub.anchor_soc == 48.0
-    assert hub.anchor_energy_wh == 500.0
-
-
-def test_charging_stop_does_not_reanchor():
-    """Transition from charging=True to charging=False should not touch anchors."""
-    hub = _make_hub(
-        last_real_soc=75.0,
-        charging=True,
-        charged_energy_wh=5000.0,
-        anchor_soc=70.0,
-        anchor_energy_wh=1000.0,
-    )
-    cfg = _FakeCfg()
-    _handle_evcc_message(hub, cfg.evcc_topic("charging"), "false", cfg)
-    assert hub.charging is False
-    assert hub.anchor_soc == 70.0      # unchanged
-    assert hub.anchor_energy_wh == 1000.0  # unchanged
-
-
-# ---------------------------------------------------------------------------
-# Test 7: efficiency factor
-# ---------------------------------------------------------------------------
 
 def test_efficiency_factor():
-    """With efficiency=0.9, the same energy input yields less SOC gain."""
-    hub = _make_hub(
-        last_real_soc=50.0,
-        charging=True,
-        charged_energy_wh=2900.0,
-        anchor_soc=50.0,
-        anchor_energy_wh=0.0,
-    )
-    result = interpolate_soc(hub, CAPACITY_KWH, efficiency=0.9)
-    expected = 50.0 + 2900.0 / 58000.0 * 100.0 * 0.9
-    assert result is not None
-    assert abs(result - expected) < 1e-6, f"Expected {expected}, got {result}"
+    est = _est(efficiency=0.9)
+    est.evcc_energy(T0, 0.0)
+    est.portal_ok(T0)
+    est.vw_reading(50.0, T0)
+    est.evcc_energy(T0 + 60, 2900.0)
+    assert abs(est.estimate(T0 + 60) - (50.0 + 5.0 * 0.9)) < 1e-6
+
+
+def test_no_reading_returns_none():
+    est = _est()
+    est.portal_ok(T0)
+    est.evcc_energy(T0, 500.0)
+    assert est.estimate(T0) is None
+
+
+def test_not_charging_returns_vw_soc():
+    est = _est()
+    est.evcc_energy(T0, 1234.0)
+    est.portal_ok(T0)
+    est.vw_reading(72.0, T0)
+    assert est.estimate(T0 + 100) == 72.0
+
+
+# ---------------------------------------------------------------------------
+# The 2026-11-18 failure modes
+# ---------------------------------------------------------------------------
+
+def test_repeated_old_value_does_not_jump_back():
+    """VW keeps re-sending 44 % in every dataset while the car charges.
+    The old code re-anchored on each dataset and soc_live fell back to 44 %."""
+    est = _est()
+    est.portal_ok(T0)
+    est.vw_reading(44.0, T0)                      # real reading before charging
+    _charge(est, T0 + 60, T0 + 1 * H, kw=11.0)    # ~11 kWh
+    for k in range(1, 5):                         # 4 datasets repeating 44 %
+        est.portal_ok(T0 + k * 900)
+        assert est.vw_reading(44.0, T0 + k * 900) is False
+    soc = est.estimate(T0 + 1 * H)
+    assert soc > 62.0, soc                        # 44 + ~11/58*100 ≈ 63
+
+
+def test_late_reading_is_advanced_by_energy_since_measurement():
+    """A changed VW value that arrives late is corrected by the energy charged
+    after it was measured (it must not throw the estimate back)."""
+    est = _est()
+    est.portal_ok(T0)
+    est.vw_reading(44.0, T0)
+    _charge(est, T0, T0 + 2 * H, kw=11.6)          # 23.2 kWh → +40 %
+    # Reading 64 % measured after 1 h of charging, delivered at 2 h.
+    est.portal_ok(T0 + 2 * H)
+    assert est.vw_reading(64.0, T0 + 1 * H) is True
+    soc = est.estimate(T0 + 2 * H)
+    assert abs(soc - 84.0) < 0.5, soc
+
+
+def test_real_values_2026_11_18():
+    """VW 44 % before, 15.36 kWh charged, VW 70 % after (real data)."""
+    est = _est()
+    est.portal_ok(T0)
+    est.vw_reading(44.0, T0)
+    _charge(est, T0 + 60, T0 + 60 + 1.4 * H, kw=10.97)
+    est.portal_ok(T0 + 2 * H)
+    soc = est.estimate(T0 + 2 * H)
+    assert 69.0 < soc < 72.0, soc
+
+
+def test_stale_portal_withholds_estimate():
+    """No successful portal poll for longer than stale_after → None, so evcc's
+    MQTT timeout kicks in instead of charging against a frozen value."""
+    est = _est(stale_after_s=2700)
+    est.portal_ok(T0)
+    est.vw_reading(76.0, T0)
+    assert est.estimate(T0 + 2000) == 76.0
+    assert est.estimate(T0 + 2701) is None
+    est.portal_ok(T0 + 3000)
+    assert est.estimate(T0 + 3000) == 76.0
+
+
+def test_older_changed_reading_is_ignored():
+    est = _est()
+    est.portal_ok(T0)
+    est.vw_reading(60.0, T0 + 100)
+    assert est.vw_reading(50.0, T0) is False
+    assert est.vw_soc == 60.0
+
+
+def test_session_reset_keeps_cumulative_energy():
+    """chargedEnergy resets per evcc session; energy must stay cumulative."""
+    est = _est()
+    est.portal_ok(T0)
+    est.vw_reading(40.0, T0)
+    est.evcc_energy(T0, 0.0)
+    est.evcc_energy(T0 + 600, 2900.0)     # session 1: +5 %
+    est.evcc_energy(T0 + 700, 0.0)        # unplug / new session
+    est.evcc_energy(T0 + 1300, 2900.0)    # session 2: +5 %
+    assert abs(est.estimate(T0 + 1300) - 50.0) < 1e-6
+
+
+def test_reading_before_history_start_is_conservative():
+    """Energy before the service started is unknown → no extra delta."""
+    est = _est()
+    est.evcc_energy(T0 + 600, 5000.0)     # first value we ever see
+    est.portal_ok(T0 + 600)
+    est.vw_reading(50.0, T0)              # measured before history start
+    assert est.estimate(T0 + 600) == 50.0
+
+
+# ---------------------------------------------------------------------------
+# evcc MQTT handler
+# ---------------------------------------------------------------------------
+
+def test_handler_feeds_energy_and_charging():
+    hub = Hub()
+    cfg = _FakeCfg()
+    _handle_evcc_message(hub, cfg.evcc_topic("charging"), "true", cfg)
+    _handle_evcc_message(hub, cfg.evcc_topic("chargedEnergy"), "1500", cfg)
+    assert hub.charging is True
+    assert hub.charged_energy_wh == 1500.0
+    assert hub.est.energy.now() == 1500.0
+    _handle_evcc_message(hub, cfg.evcc_topic("chargedEnergy"), "oops", cfg)
+    assert hub.charged_energy_wh == 1500.0
 
 
 # ---------------------------------------------------------------------------
@@ -319,22 +265,7 @@ def test_soc_live_state_payload_format():
 # ---------------------------------------------------------------------------
 
 def _run_all():
-    tests = [
-        test_basic_interpolation,
-        test_basic_interpolation_partial,
-        test_clamp_to_100,
-        test_clamp_floor_is_anchor_soc,
-        test_not_charging_returns_last_real_soc,
-        test_no_real_soc_returns_none,
-        test_reanchor_on_new_real_soc,
-        test_charged_energy_reset_via_handle,
-        test_charged_energy_advances_normally,
-        test_charging_start_triggers_reanchor,
-        test_charging_stop_does_not_reanchor,
-        test_efficiency_factor,
-        test_soc_live_messages_structure,
-        test_soc_live_state_payload_format,
-        test_soc_live_state_retain_flag,
+    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")
     ]
     passed = 0
     failed = 0

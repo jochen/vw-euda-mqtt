@@ -27,6 +27,8 @@ from .const import (
     OIDC_STATE,
     RELATION_PATH,
     USER_AGENT,
+    BROWSER_ACCEPT,
+    CALLBACK_LOGIN_PATH,
     VEHICLES_PATH,
 )
 
@@ -179,7 +181,7 @@ class EudaApiClient:
     # -- low level ---------------------------------------------------------
 
     async def _get(self, url: str, *, headers: dict | None = None, allow_redirects: bool = True):
-        h = {"User-Agent": USER_AGENT, **(headers or {})}
+        h = {"User-Agent": USER_AGENT, "Accept": BROWSER_ACCEPT, **(headers or {})}
         return await self._session.get(url, headers=h, allow_redirects=allow_redirects)
 
     # -- authentication ----------------------------------------------------
@@ -261,13 +263,30 @@ class EudaApiClient:
         async with self._session.post(
             authenticate_action,
             data=fields2,
-            headers={"User-Agent": USER_AGENT, "Referer": authenticate_url},
+            headers={"User-Agent": USER_AGENT, "Referer": authenticate_url,
+                     "Accept": BROWSER_ACCEPT},
         ) as resp:
+            for hop in resp.history:
+                _LOGGER.debug("login step4: hop %s %s", hop.status, hop.url)
             landing = str(resp.url)
             landing_html = await resp.text()
-            if resp.status >= 400:
+            # The moved portal (2026-11) answers the final user.html page with
+            # HTTP 406 for non-browser clients, but by then the callback has
+            # already set the session cookies — that is a successful login.
+            passed_callback = any(
+                urlparse(str(h.url)).path == CALLBACK_LOGIN_PATH
+                and urlparse(str(h.url)).netloc == urlparse(BASE_URL).netloc
+                for h in resp.history
+            )
+            if resp.status >= 400 and passed_callback:
                 _LOGGER.debug(
-                    "login step4: HTTP %s body[:500]=%s", resp.status, landing_html[:500]
+                    "login step4: callback passed, ignoring HTTP %s on %s",
+                    resp.status, landing,
+                )
+            elif resp.status >= 400:
+                _LOGGER.debug(
+                    "login step4: HTTP %s at %s body[:500]=%s",
+                    resp.status, landing, landing_html[:500],
                 )
                 err = _login_error(landing_html)
                 raise AuthError(err or f"Login rejected (HTTP {resp.status})")

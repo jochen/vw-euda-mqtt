@@ -17,7 +17,9 @@ def raw_unique_id(vin: str, key: str) -> str:
     return f"{vin}_{key}"
 
 # --- Portal / OIDC endpoints ---------------------------------------------
-BASE_URL = "https://eu-data-act.drivesomethinggreater.com"
+# Portal moved 2026-11-16; the old drivesomethinggreater.com host now
+# redirects API calls to a path that answers HTTP 404.
+BASE_URL = "https://eu-data-act.vwgroup-datahub.com"
 IDENTITY_BASE = "https://identity.vwgroup.io"
 
 # Brand is part of the OIDC state; VW passenger cars by default.
@@ -32,8 +34,9 @@ OIDC_CLIENT_ID = "9b58543e-1c15-4193-91d5-8a14145bebb0@apps_vw-dilab_com"
 OIDC_SCOPE = "openid cars profile"
 OIDC_REDIRECT_URI = BASE_URL + "/login"
 # state encodes country__language__brand (echoed back to the portal callback).
-DEFAULT_COUNTRY = "si"
-DEFAULT_LANGUAGE = "sl"
+# The moved portal (2026-11) serves /de/en/...; evcc uses de__en as well.
+DEFAULT_COUNTRY = "de"
+DEFAULT_LANGUAGE = "en"
 OIDC_STATE = f"{DEFAULT_COUNTRY}__{DEFAULT_LANGUAGE}__{BRAND}"
 
 # proxy_api paths (relative to BASE_URL)
@@ -46,6 +49,13 @@ DOWNLOAD_PATH = "/proxy_api/euda-apim/datadelivery/vehicles/{vin}/{identifier}/d
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+)
+
+# Browser-like Accept header: the moved portal answers 406 to bare */* on
+# some hops of the login redirect chain.
+BROWSER_ACCEPT = (
+    "text/html,application/xhtml+xml,application/xml;q=0.9,"
+    "application/json;q=0.9,*/*;q=0.8"
 )
 
 # --- Config entry keys ----------------------------------------------------

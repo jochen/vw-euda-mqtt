@@ -1,7 +1,7 @@
 # vw-euda-mqtt
 
 A standalone Python asyncio daemon that pulls **VW ID.3** vehicle data from the
-[VW EU Data Act portal](https://eu-data-act.drivesomethinggreater.com/) and
+[VW EU Data Act portal](https://eu-data-act.vwgroup-datahub.com/) (moved from drivesomethinggreater.com on 2026-11-16) and
 publishes it to MQTT with **Home Assistant MQTT Discovery**.
 
 Repo: https://github.com/jochen/vw-euda-mqtt
@@ -18,7 +18,7 @@ there is no fix.
 
 Under **EU Regulation 2023/2854** (EU Data Act, in force since 2025-09-12) VW
 must provide vehicle data in a machine-readable format. The
-[EU Data Act portal](https://eu-data-act.drivesomethinggreater.com/) delivers
+[EU Data Act portal](https://eu-data-act.vwgroup-datahub.com/) delivers
 read-only JSON snapshots on a 15-minute interval. This daemon uses that portal
 as its data source.
 
@@ -40,16 +40,21 @@ The daemon runs three concurrent asyncio tasks:
    (`charging`, `connected`, `chargedEnergy` on the configured loadpoint) to
    track real-time charging state and session energy.
 
-3. **SOC interpolation** — between VW's 15-minute readings, estimates a live
-   SOC anchored to the last real VW reading plus evcc's session energy:
+3. **SOC interpolation** — VW's SOC only changes when the car sends a new
+   battery report; every 15-minute dataset in between *repeats* the old value.
+   The estimator therefore only takes a VW reading when its value changes,
+   dates it by the dataset's car capture time, and adds the energy evcc
+   charged **since that moment** (from a cumulative, timestamped history of
+   evcc's per-session `chargedEnergy`):
 
    ```
-   soc_live = anchor_soc + chargedEnergy_Wh / (capacity_kWh × 1000) × 100
+   soc_live = vw_soc + (E(now) - E(t_measured)) / (capacity_kWh × 1000) × 100 × efficiency
    ```
 
-   Published to `<base_topic>/soc_live` (configurable). The raw VW SOC on
-   `<base_topic>/soc` is never modified. Each new VW dataset re-anchors the
-   estimate, so drift self-corrects every ~15 minutes.
+   Repeated or late readings therefore never throw `soc_live` back during
+   charging. If the portal has not delivered for `SOC_STALE_AFTER_S`, `soc_live`
+   is withheld so evcc's MQTT timeout takes over. The raw VW SOC on
+   `<base_topic>/soc` is published unchanged.
 
 ---
 
@@ -94,7 +99,7 @@ All messages are published with `retain=True`.
 
 This is a **manual, per-user** step done once in a browser:
 
-1. Log in at https://eu-data-act.drivesomethinggreater.com/ with your VW-ID
+1. Log in at https://eu-data-act.vwgroup-datahub.com/ with your VW-ID
    credentials.
 2. Go to **Data clusters → Vehicle overview** and link your car.
 3. Click **"Get customised data"**, choose **continuous** frequency and set the
@@ -141,7 +146,8 @@ Copy `.env.example` to `.env`. All variables:
 | `VEHICLE_CAPACITY_KWH` | `58` | Usable battery capacity in kWh (ID.3 Pro = 58) |
 | `SOC_LIVE_SUBTOPIC` | `soc_live` | Subtopic for the interpolated SOC value |
 | `INTERP_INTERVAL_S` | `60` | How often (seconds) to recalculate and publish `soc_live` |
-| `CHARGE_EFFICIENCY` | `1.0` | Charging efficiency factor for interpolation (e.g. 0.92) |
+| `CHARGE_EFFICIENCY` | `1.0` | Charging efficiency factor for interpolation (1.0 matched real data 2026-11-18) |
+| `SOC_STALE_AFTER_S` | `2700` | Stop publishing `soc_live` when the portal has not delivered for this long |
 
 > **Account lockout warning.** The daemon persists its session cookie and only
 > re-authenticates on an explicit 401/403 response. Do **not** wrap it in a

@@ -24,6 +24,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,6 +44,7 @@ from euda import api as euda_api  # noqa: E402
 from euda.api import ApiError, AuthError, EudaApiClient  # noqa: E402
 from euda.data import Dataset  # noqa: E402
 from euda.mqtt import build_messages, soc_live_discovery, soc_live_state  # noqa: E402
+from euda.soc_estimator import SocEstimator  # noqa: E402
 
 log = logging.getLogger("euda_service")
 
@@ -69,13 +71,9 @@ AVAILABILITY_SUBTOPIC = "availability"
 
 @dataclass
 class Hub:
-    """Mutable shared state between the three concurrent tasks.
-
-    All fields are written from async tasks and read from others.  Because the
-    event loop is single-threaded no locking is needed.
-    """
-    # Last real VW SOC reading (None until first successful poll).
-    last_real_soc: Optional[float] = None
+    """Mutable shared state between the concurrent tasks (single event loop,
+    so no locking)."""
+    est: SocEstimator = field(default_factory=SocEstimator)
 
     # VIN (set once after first successful poll).
     vin: Optional[str] = None
@@ -85,50 +83,8 @@ class Hub:
     connected: bool = False
     charged_energy_wh: float = 0.0   # current session energy in Wh
 
-    # ---- interpolation anchors -------------------------------------------
-    anchor_soc: Optional[float] = None        # % at anchor time
-    anchor_energy_wh: Optional[float] = None  # Wh at anchor time
-
-    # ---- interpolation publication tracking ------------------------------
     last_published_soc_live: Optional[float] = None
-
-
-# ---------------------------------------------------------------------------
-# Interpolation logic
-# ---------------------------------------------------------------------------
-
-def interpolate_soc(
-    hub: Hub,
-    capacity_kwh: float,
-    efficiency: float,
-) -> Optional[float]:
-    """Return estimated live SOC or None if not enough data yet.
-
-    When charging and anchors are set, advance from anchor using evcc energy.
-    When not charging (or anchor missing), return last real VW SOC.
-    """
-    if hub.last_real_soc is None:
-        return None
-
-    if hub.charging and hub.anchor_soc is not None and hub.anchor_energy_wh is not None:
-        delta_wh = hub.charged_energy_wh - hub.anchor_energy_wh
-        if delta_wh < 0:
-            # Session reset detected (chargedEnergy wrapped or reset).
-            # Caller re-anchors on next evcc message; for now just use anchor_soc.
-            delta_wh = 0.0
-        delta_soc = delta_wh / (capacity_kwh * 1000.0) * 100.0 * efficiency
-        raw = hub.anchor_soc + delta_soc
-        return max(float(hub.anchor_soc), min(100.0, raw))
-
-    # Not charging or no anchors: best estimate is last real soc.
-    return float(hub.last_real_soc)
-
-
-def _re_anchor(hub: Hub, soc: float) -> None:
-    """Set interpolation anchor to ``soc`` at the current evcc energy level."""
-    hub.anchor_soc = soc
-    hub.anchor_energy_wh = hub.charged_energy_wh
-    log.debug("Anker gesetzt: soc=%.1f%%, energy=%.0f Wh", soc, hub.charged_energy_wh)
+    stale_logged: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +165,9 @@ class Config:
         self.soc_live_subtopic = os.environ.get("SOC_LIVE_SUBTOPIC", "soc_live")
         self.interp_interval_s = float(os.environ.get("INTERP_INTERVAL_S", "60"))
         self.charge_efficiency = float(os.environ.get("CHARGE_EFFICIENCY", "1.0"))
+        # Withhold soc_live when the portal has not delivered for this long
+        # (3 missed 15-min drops) — evcc's MQTT timeout then takes over.
+        self.soc_stale_after_s = float(os.environ.get("SOC_STALE_AFTER_S", "2700"))
         # soc_live feeds evcc → keep it non-retained so a stale value can't
         # linger and make evcc charge on after this service stops.
         self.soc_live_retain = os.environ.get("SOC_LIVE_RETAIN", "false").lower() in (
@@ -332,7 +291,7 @@ async def _poll_once(
         listing = await client.async_list_datasets(vin, identifier)
     except ApiError as e:
         msg = str(e)
-        if "HTTP 400" in msg or "HTTP 500" in msg:
+        if "HTTP 400" in msg or "HTTP 404" in msg or "HTTP 500" in msg:
             new_id = await _maybe_refresh_identifier(client, vin, identifier)
             if new_id:
                 return new_id, RETRY_INTERVAL
@@ -341,6 +300,7 @@ async def _poll_once(
             return identifier, RETRY_INTERVAL
         raise
 
+    hub.est.portal_ok(time.time())
     content = [e for e in listing if e.get("name") and not e["name"].endswith(NO_CONTENT)]
     if not content:
         new_id = await _maybe_refresh_identifier(client, vin, identifier)
@@ -350,7 +310,9 @@ async def _poll_once(
         return identifier, _next_delay(listing)
 
     newest = max(content, key=lambda e: _created_on(e) or datetime.min.replace(tzinfo=timezone.utc))
-    if newest["name"] == state.get("last_dataset"):
+    # After a restart the estimator is empty: re-read the newest dataset once
+    # even if it was already published, so soc_live is available right away.
+    if newest["name"] == state.get("last_dataset") and hub.est.vw_soc is not None:
         log.debug("Kein neues Dataset (%s)", newest["name"])
         return identifier, _next_delay(listing)
 
@@ -369,18 +331,29 @@ async def _poll_once(
     else:
         log.warning("Dataset enthielt keine kuratierten Felder")
 
-    # Extract real VW SOC and update hub.
+    # Offer the VW SOC to the estimator. It only re-anchors when the value
+    # changed — datasets keep repeating the car's last battery report.
     dp_soc = ds.by_field("battery_state_report.soc")
     if dp_soc is not None and dp_soc.value is not None:
         new_soc = float(dp_soc.value)
-        hub.last_real_soc = new_soc
-        # Re-anchor interpolation to the fresh reading.
-        _re_anchor(hub, new_soc)
-        log.debug("Echter VW-SOC: %.1f%% → Anker aktualisiert", new_soc)
+        measured = _reading_time(ds, newest)
+        if hub.est.vw_reading(new_soc, measured):
+            log.info("Neuer VW-SOC %.0f%% (gemessen ~%s) → Anker gesetzt",
+                     new_soc, datetime.fromtimestamp(measured, timezone.utc).isoformat())
+        else:
+            log.info("VW-SOC %.0f%% unverändert (Wiederholung) → Anker bleibt", new_soc)
 
     state["last_dataset"] = newest["name"]
     _save_state(state)
     return identifier, _next_delay(listing)
+
+
+def _reading_time(ds: Dataset, entry: dict) -> float:
+    """Best guess for when the car measured the values in ``ds``: the newest
+    car capture time, but never later than the dataset's creation."""
+    created = _created_on(entry) or datetime.now(timezone.utc)
+    t = ds.captured_at if ds.captured_at and ds.captured_at <= created else created
+    return t.timestamp()
 
 
 async def _maybe_refresh_identifier(client: EudaApiClient, vin: str, identifier: str) -> str | None:
@@ -406,7 +379,7 @@ async def evcc_listener_task(
     hub: Hub,
     stop: asyncio.Event,
 ) -> None:
-    """Subscribe to evcc MQTT topics; update hub fields and handle re-anchoring."""
+    """Subscribe to evcc MQTT topics and feed charging state/energy into the hub."""
     lp = cfg.evcc_loadpoint
     evcc_base = cfg.evcc_base_topic
 
@@ -469,14 +442,8 @@ def _handle_evcc_message(hub: Hub, topic: str, raw: str, cfg: Config) -> None:
     suffix = topic.split(f"/loadpoints/{lp}/", 1)[-1] if f"/loadpoints/{lp}/" in topic else ""
 
     if suffix == "charging":
-        prev = hub.charging
         hub.charging = raw.lower() == "true"
         log.debug("evcc charging: %s", hub.charging)
-        # Edge: false → true (charging starts). Re-anchor with current energy.
-        if not prev and hub.charging and hub.last_real_soc is not None:
-            _re_anchor(hub, hub.last_real_soc)
-            log.info("Ladestart erkannt: Anker gesetzt (soc=%.1f%%, energy=%.0f Wh)",
-                     hub.anchor_soc, hub.anchor_energy_wh)
 
     elif suffix == "connected":
         hub.connected = raw.lower() == "true"
@@ -488,20 +455,8 @@ def _handle_evcc_message(hub: Hub, topic: str, raw: str, cfg: Config) -> None:
         except ValueError:
             log.warning("chargedEnergy: ungültiger Wert %r", raw)
             return
-        # Detect session reset (energy went backwards while charging).
-        if (
-            hub.charging
-            and hub.anchor_energy_wh is not None
-            and new_energy < hub.anchor_energy_wh
-        ):
-            log.info(
-                "chargedEnergy-Reset erkannt (%.0f < %.0f Wh) — re-anchor",
-                new_energy, hub.anchor_energy_wh,
-            )
-            if hub.last_real_soc is not None:
-                hub.anchor_soc = hub.last_real_soc
-            hub.anchor_energy_wh = new_energy
         hub.charged_energy_wh = new_energy
+        hub.est.evcc_energy(time.time(), new_energy)
         log.debug("evcc chargedEnergy: %.0f Wh", new_energy)
 
     elif suffix == "vehicleSoc":
@@ -533,10 +488,21 @@ async def interpolation_task(
         if stop.is_set():
             break
 
-        soc_live = interpolate_soc(hub, cfg.vehicle_capacity_kwh, cfg.charge_efficiency)
+        now = time.time()
+        soc_live = hub.est.estimate(now)
         if soc_live is None:
-            log.debug("interpolation: noch kein realer VW-SOC — überspringe")
+            if hub.est.vw_soc is not None and hub.est.is_stale(now):
+                if not hub.stale_logged:
+                    log.warning("Portal-Daten veraltet (> %.0f s ohne Erfolg) — "
+                                "soc_live wird NICHT publiziert (evcc-timeout greift)",
+                                hub.est.stale_after_s)
+                    hub.stale_logged = True
+            else:
+                log.debug("interpolation: noch kein realer VW-SOC — überspringe")
             continue
+        if hub.stale_logged:
+            log.info("Portal-Daten wieder aktuell — soc_live wird wieder publiziert")
+            hub.stale_logged = False
 
         mqtt_client = mqtt_client_ref[0] if mqtt_client_ref else None
         if mqtt_client is None:
@@ -564,9 +530,9 @@ async def interpolation_task(
             hub.last_published_soc_live = rounded
             log.log(
                 logging.INFO if changed else logging.DEBUG,
-                "soc_live=%.1f%% (charging=%s, anchor_soc=%s, energy=%.0f Wh)",
+                "soc_live=%.1f%% (charging=%s, vw_soc=%s, session=%.0f Wh)",
                 rounded, hub.charging,
-                f"{hub.anchor_soc:.1f}%" if hub.anchor_soc is not None else "None",
+                f"{hub.est.vw_soc:.0f}%" if hub.est.vw_soc is not None else "None",
                 hub.charged_energy_wh,
             )
         except aiomqtt.MqttError as e:
@@ -647,7 +613,11 @@ async def mqtt_task(
 # ---------------------------------------------------------------------------
 
 async def run(cfg: Config, stop: asyncio.Event) -> None:
-    hub = Hub()
+    hub = Hub(est=SocEstimator(
+        capacity_kwh=cfg.vehicle_capacity_kwh,
+        efficiency=cfg.charge_efficiency,
+        stale_after_s=cfg.soc_stale_after_s,
+    ))
     # Shared mutable reference to the active aiomqtt.Client.
     # A list is used so tasks can check/replace it without a closure.
     mqtt_client_ref: list = []
