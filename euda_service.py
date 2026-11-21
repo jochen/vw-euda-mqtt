@@ -19,6 +19,7 @@ New in this version:
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import logging
 import os
@@ -52,6 +53,9 @@ HERE = Path(__file__).parent
 COOKIE_FILE = HERE / "euda_cookies.pickle"
 STATE_FILE = HERE / "euda_state.json"
 ESTIMATOR_FILE = HERE / "euda_estimator.json"
+# Raw datasets are archived here (gzip, per month). Empty VW_ARCHIVE_DIR = off.
+_archive_env = os.environ.get("VW_ARCHIVE_DIR", str(HERE / "archive"))
+ARCHIVE_DIR = Path(_archive_env) if _archive_env else None
 
 NO_CONTENT = "_no_content_found.zip"
 DATASET_INTERVAL = 15 * 60       # seconds
@@ -84,6 +88,7 @@ class Hub:
     connected: bool = False
     charged_energy_wh: float = 0.0   # current session energy in Wh
 
+    last_hv_soc: Optional[float] = None   # last battery_level_HV.value seen
     last_published_soc_live: Optional[float] = None
     stale_logged: bool = False
 
@@ -351,6 +356,7 @@ async def _poll_once(
 
     log.info("Neues Dataset: %s", newest["name"])
     payload = await client.async_download_dataset(vin, identifier, newest["name"])
+    _archive_dataset(newest["name"], payload)
     ds = Dataset.from_json(payload)
     messages = build_messages(ds, cfg.base_topic)
 
@@ -366,19 +372,65 @@ async def _poll_once(
 
     # Offer the VW SOC to the estimator. It only re-anchors when the value
     # changed — datasets keep repeating the car's last battery report.
-    dp_soc = ds.by_field("battery_state_report.soc")
-    if dp_soc is not None and dp_soc.value is not None:
-        new_soc = float(dp_soc.value)
+    picked = _select_soc(ds, hub)
+    if picked is not None:
+        new_soc, source = picked
         measured = _reading_time(ds, newest)
         if hub.est.vw_reading(new_soc, measured):
-            log.info("Neuer VW-SOC %.0f%% (gemessen ~%s) → Anker gesetzt",
-                     new_soc, datetime.fromtimestamp(measured, timezone.utc).isoformat())
+            log.info("Neuer VW-SOC %.0f%% aus %s (gemessen ~%s) → Anker gesetzt",
+                     new_soc, source, datetime.fromtimestamp(measured, timezone.utc).isoformat())
         else:
-            log.info("VW-SOC %.0f%% unverändert (Wiederholung) → Anker bleibt", new_soc)
+            log.info("VW-SOC %.0f%% aus %s unverändert (Wiederholung) → Anker bleibt",
+                     new_soc, source)
 
     state["last_dataset"] = newest["name"]
     _save_state(state)
     return identifier, _next_delay(listing)
+
+
+def _select_soc(ds: Dataset, hub: Hub) -> tuple[float, str] | None:
+    """Pick the SOC reading from a dataset.
+
+    Primary: battery_state_report.soc (pinned current-SOC key).
+    Fallback: battery_level_HV.value (state VALID) — but only if it *changed*
+    since we last saw it. It runs ~0–2 % off the primary (18.11.: 42 vs 44),
+    so an unchanged HV value carries no news and must not pull the anchor
+    down; a changed one is a fresh report (21.11. 10:56: primary missing,
+    HV 36 → 34 just before charging).
+    """
+    hv = ds.by_field("battery_level_HV.value")
+    hv_state = ds.by_field("battery_level_HV.state")
+    hv_val = None
+    if hv is not None and hv.value is not None and (
+            hv_state is None or str(hv_state.value).upper() == "VALID"):
+        try:
+            hv_val = float(hv.value)
+        except (TypeError, ValueError):
+            hv_val = None
+    prev_hv, hub.last_hv_soc = hub.last_hv_soc, (hv_val if hv_val is not None else hub.last_hv_soc)
+
+    dp = ds.by_field("battery_state_report.soc")
+    if dp is not None and dp.value is not None:
+        return float(dp.value), "battery_state_report"
+    if hv_val is not None and hv_val != prev_hv:
+        return hv_val, "battery_level_HV (Fallback)"
+    return None
+
+
+def _archive_dataset(name: str, payload: dict) -> None:
+    """Keep every downloaded raw dataset (evidence + later analysis)."""
+    if not ARCHIVE_DIR:
+        return
+    try:
+        stamp = _filename_timestamp(name) or datetime.now(timezone.utc)
+        d = ARCHIVE_DIR / stamp.strftime("%Y-%m")
+        d.mkdir(parents=True, exist_ok=True)
+        f = d / (name.rsplit(".", 1)[0] + ".json.gz")
+        if not f.exists():
+            with gzip.open(f, "wt", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False)
+    except OSError as e:
+        log.warning("Dataset-Archiv: %s nicht gespeichert: %s", name, e)
 
 
 def _reading_time(ds: Dataset, entry: dict) -> float:

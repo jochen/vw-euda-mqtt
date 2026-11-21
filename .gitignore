@@ -11,3 +11,4 @@ euda_state.json
 euda_estimator.json
 euda_estimator.tmp
 *.bak-*
+archive/

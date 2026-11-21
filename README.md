@@ -157,6 +157,13 @@ retained) to `ohm/car/id3/soc_manual/set`. It immediately becomes the anchor for
 last anchor) is published retained on `ohm/car/id3/soc_manual/result`;
 calibrations are kept in `euda_estimator.json`.
 
+**Fallback `battery_level_HV.value`.** If a dataset lacks the current-SOC key,
+`battery_level_HV.value` (state `VALID`) is used — only when it changed since
+the previous dataset, because it can sit 1–2 % off the primary value.
+
+**Raw dataset archive.** Every downloaded dataset is stored gzip-compressed in
+`archive/YYYY-MM/<name>.json.gz` (`VW_ARCHIVE_DIR`, empty = off; ~8 KB each).
+
 **Persistence.** Anchor and energy history are saved to `euda_estimator.json`
 every tick, so a restart no longer resets `soc_live` to the last VW value.
 
