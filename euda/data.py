@@ -163,6 +163,20 @@ class DataPoint:
         return v
 
 
+# Field names that are shared by data points with *different* meaning. For
+# these, only the listed key (UUID, identical for all vehicles) is used — no
+# fallback to the others.
+#
+# battery_state_report.soc (incident 2026-11-21): three keys share the name.
+#   506cb83e-…  "The int value of battery state report soc"  → current SOC
+#   93b55324-…, 7bddd5e7-…  "State of Charging when charging is started"
+#   The latter stayed at 74 % for days. Whenever a dataset lacked 506cb83e,
+#   the 74 % was taken as a fresh reading and soc_live jumped from 48 to 86 %.
+PINNED_FIELD_KEYS: dict[str, str] = {
+    "battery_state_report.soc": "506cb83e-f99f-3af3-bbeb-0429b69a78d9",
+}
+
+
 @dataclass
 class Dataset:
     """A parsed dataset JSON, enriched from the data dictionary."""
@@ -215,6 +229,11 @@ class Dataset:
         curated sensor consistently tracks the same data point across refreshes
         instead of flip-flopping when the portal reshuffles the array.
         """
+        pinned = PINNED_FIELD_KEYS.get(field_name)
+        if pinned is not None:
+            # Only the pinned key carries the value we want; the other entries
+            # with the same name mean something else (see PINNED_FIELD_KEYS).
+            return self.points.get(pinned)
         matches = [dp for dp in self.points.values() if dp.field_name == field_name]
         return min(matches, key=lambda dp: dp.key) if matches else None
 

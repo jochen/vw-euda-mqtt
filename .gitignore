@@ -8,3 +8,6 @@ venv-vwcarnet/
 .ref/
 euda_cookies.pickle
 euda_state.json
+euda_estimator.json
+euda_estimator.tmp
+*.bak-*

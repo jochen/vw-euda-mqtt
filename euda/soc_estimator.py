@@ -35,6 +35,9 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 HISTORY_KEEP_S = 48 * 3600
+# Below this, 1 % SOC rounding dominates the efficiency estimate.
+MIN_CALIBRATION_WH = 3000.0
+MAX_CALIBRATIONS = 30
 
 
 @dataclass
@@ -100,6 +103,7 @@ class SocEstimator:
     vw_soc_time: Optional[float] = None      # epoch s of the measurement
     last_portal_ok: Optional[float] = None   # epoch s of last good list/poll
     energy: EnergyHistory = field(default_factory=EnergyHistory)
+    calibrations: list = field(default_factory=list)  # from manual readings
 
     # -- inputs ------------------------------------------------------------
 
@@ -128,6 +132,63 @@ class SocEstimator:
 
     def evcc_energy(self, ts: float, session_wh: float) -> None:
         self.energy.add_session_value(ts, session_wh)
+
+    def manual_reading(self, soc: float, ts: float) -> dict:
+        """A SOC reported by a human (e.g. read from the VW app via Gaston).
+
+        Always becomes the new anchor — it is fresher and more trustworthy than
+        anything the portal delivers. If enough energy went in since the old
+        anchor, the implied charging efficiency is computed and remembered
+        (``calibrations``) so CHARGE_EFFICIENCY can be tuned from real data.
+        """
+        result: dict = {"soc": float(soc), "ts": ts,
+                        "previous_estimate": None, "efficiency": None, "delta_wh": None}
+        if self.vw_soc is not None and self.vw_soc_time is not None:
+            # Ignore staleness here: the human value is what matters.
+            e_now, e_then = self.energy.now(), self.energy.at(self.vw_soc_time)
+            delta_wh = max(0.0, e_now - e_then) if e_now is not None and e_then is not None else 0.0
+            prev = self.vw_soc + delta_wh / (self.capacity_kwh * 1000.0) * 100.0 * self.efficiency
+            result["previous_estimate"] = round(max(self.vw_soc, min(100.0, prev)), 1)
+            result["delta_wh"] = round(delta_wh)
+            if delta_wh >= MIN_CALIBRATION_WH and soc > self.vw_soc:
+                eff = (soc - self.vw_soc) / 100.0 * self.capacity_kwh * 1000.0 / delta_wh
+                result["efficiency"] = round(eff, 3)
+                self.calibrations.append({"ts": ts, "from_soc": self.vw_soc, "to_soc": float(soc),
+                                          "delta_wh": round(delta_wh), "efficiency": round(eff, 3)})
+                del self.calibrations[:-MAX_CALIBRATIONS]
+        self.vw_soc = float(soc)
+        self.vw_soc_time = ts
+        self.last_portal_ok = max(self.last_portal_ok or 0.0, ts)
+        return result
+
+    # -- persistence (survive service restarts) ----------------------------
+
+    def to_dict(self) -> dict:
+        e = self.energy
+        return {
+            "vw_soc": self.vw_soc,
+            "vw_soc_time": self.vw_soc_time,
+            "last_portal_ok": self.last_portal_ok,
+            "calibrations": self.calibrations,
+            "energy": {
+                "times": e.times, "values": e.values,
+                "offset": e._offset, "last_session": e._last_session,
+            },
+        }
+
+    def load_dict(self, d: dict) -> None:
+        """Restore state saved by :meth:`to_dict`; tunables stay as configured."""
+        self.vw_soc = d.get("vw_soc")
+        self.vw_soc_time = d.get("vw_soc_time")
+        self.last_portal_ok = d.get("last_portal_ok")
+        self.calibrations = list(d.get("calibrations") or [])
+        e = d.get("energy") or {}
+        times, values = list(e.get("times") or []), list(e.get("values") or [])
+        if len(times) != len(values):
+            times, values = [], []
+        self.energy = EnergyHistory(times=times, values=values,
+                                    _offset=float(e.get("offset") or 0.0),
+                                    _last_session=e.get("last_session"))
 
     # -- output ------------------------------------------------------------
 

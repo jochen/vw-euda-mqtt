@@ -51,6 +51,7 @@ log = logging.getLogger("euda_service")
 HERE = Path(__file__).parent
 COOKIE_FILE = HERE / "euda_cookies.pickle"
 STATE_FILE = HERE / "euda_state.json"
+ESTIMATOR_FILE = HERE / "euda_estimator.json"
 
 NO_CONTENT = "_no_content_found.zip"
 DATASET_INTERVAL = 15 * 60       # seconds
@@ -141,6 +142,32 @@ def _save_state(state: dict) -> None:
         log.warning("State konnte nicht gespeichert werden: %s", e)
 
 
+def _load_estimator(est: SocEstimator) -> None:
+    """Restore anchor + energy history so a restart doesn't lose the charged
+    energy since the last VW reading (otherwise soc_live drops back)."""
+    try:
+        data = json.loads(ESTIMATOR_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as e:
+        log.warning("Schätzer-Zustand nicht ladbar (%s) — starte leer", e)
+        return
+    est.load_dict(data)
+    if est.vw_soc is not None and est.vw_soc_time is not None:
+        log.info("Schätzer-Zustand geladen: VW-SOC %.0f%% (gemessen %s), %d Energiepunkte",
+                 est.vw_soc, datetime.fromtimestamp(est.vw_soc_time, timezone.utc).isoformat(),
+                 len(est.energy.times))
+
+
+def _save_estimator(est: SocEstimator) -> None:
+    tmp = ESTIMATOR_FILE.with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps(est.to_dict()), encoding="utf-8")
+        tmp.replace(ESTIMATOR_FILE)
+    except OSError as e:
+        log.warning("Schätzer-Zustand konnte nicht gespeichert werden: %s", e)
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -163,6 +190,12 @@ class Config:
         self.evcc_loadpoint = os.environ.get("EVCC_LOADPOINT", "1")
         self.vehicle_capacity_kwh = float(os.environ.get("VEHICLE_CAPACITY_KWH", "58"))
         self.soc_live_subtopic = os.environ.get("SOC_LIVE_SUBTOPIC", "soc_live")
+        # Manual SOC (e.g. read from the VW app, sent by Gaston): publish a
+        # number (non-retained) here → becomes the new anchor immediately.
+        # The outcome is published retained as JSON on <base>/soc_manual/result.
+        self.soc_manual_topic = os.environ.get(
+            "SOC_MANUAL_TOPIC", f"{self.base_topic}/soc_manual/set")
+        self.soc_manual_result_topic = self.soc_manual_topic.rsplit("/", 1)[0] + "/result"
         self.interp_interval_s = float(os.environ.get("INTERP_INTERVAL_S", "60"))
         self.charge_efficiency = float(os.environ.get("CHARGE_EFFICIENCY", "1.0"))
         # Withhold soc_live when the portal has not delivered for this long
@@ -403,7 +436,9 @@ async def evcc_listener_task(
                 backoff = MQTT_RECONNECT_DELAY  # reset on success
                 for topic in topics:
                     await client.subscribe(topic)
-                log.info("evcc listener: abonniert unter %s/loadpoints/%s/...", evcc_base, lp)
+                await client.subscribe(cfg.soc_manual_topic)
+                log.info("evcc listener: abonniert unter %s/loadpoints/%s/... und %s",
+                         evcc_base, lp, cfg.soc_manual_topic)
 
                 # aiomqtt 2.x: `client.messages` is an async-generator property,
                 # iterated directly (no `.messages()` call / context manager).
@@ -414,6 +449,17 @@ async def evcc_listener_task(
                     payload = message.payload
                     raw = (payload.decode(errors="replace") if isinstance(payload, bytes)
                            else str(payload)).strip()
+                    if t == cfg.soc_manual_topic:
+                        if message.retain:
+                            # A retained "set" would re-apply an old value on
+                            # every reconnect — refuse it.
+                            log.warning("Manueller SOC als retained-Nachricht ignoriert: %r", raw)
+                            continue
+                        result = _handle_manual_soc(hub, raw)
+                        _save_estimator(hub.est)
+                        await client.publish(cfg.soc_manual_result_topic,
+                                             json.dumps(result), retain=True)
+                        continue
                     _handle_evcc_message(hub, t, raw, cfg)
 
         except aiomqtt.MqttError as e:
@@ -434,6 +480,35 @@ async def evcc_listener_task(
             except asyncio.TimeoutError:
                 pass
             backoff = min(backoff * 2, MQTT_RECONNECT_MAX)
+
+
+def _parse_manual_soc(raw: str) -> float:
+    """Accept '50', '50%', '50,5' or JSON {"soc": 50}."""
+    s = raw.strip()
+    if s.startswith("{"):
+        s = str(json.loads(s).get("soc", ""))
+    s = s.rstrip("%").strip().replace(",", ".")
+    soc = float(s)
+    if not 0.0 <= soc <= 100.0:
+        raise ValueError(f"außerhalb 0–100: {soc}")
+    return soc
+
+
+def _handle_manual_soc(hub: Hub, raw: str) -> dict:
+    """Apply a manually reported SOC; returns the result published as JSON."""
+    now = time.time()
+    try:
+        soc = _parse_manual_soc(raw)
+    except (ValueError, TypeError, AttributeError) as e:
+        log.warning("Manueller SOC ungültig (%r): %s", raw, e)
+        return {"ok": False, "error": f"ungültiger Wert: {raw!r}", "ts": now}
+    r = hub.est.manual_reading(soc, now)
+    hub.stale_logged = False
+    log.info("Manueller SOC %.1f%% übernommen → Anker gesetzt (vorher geschätzt %s%%, "
+             "seit letztem Anker %s Wh, gemessene Effizienz %s; eingestellt %.2f)",
+             soc, r["previous_estimate"], r["delta_wh"], r["efficiency"], hub.est.efficiency)
+    return {"ok": True, **r, "configured_efficiency": hub.est.efficiency,
+            "time": datetime.fromtimestamp(now, timezone.utc).isoformat()}
 
 
 def _handle_evcc_message(hub: Hub, topic: str, raw: str, cfg: Config) -> None:
@@ -489,6 +564,7 @@ async def interpolation_task(
             break
 
         now = time.time()
+        _save_estimator(hub.est)
         soc_live = hub.est.estimate(now)
         if soc_live is None:
             if hub.est.vw_soc is not None and hub.est.is_stale(now):
@@ -618,6 +694,7 @@ async def run(cfg: Config, stop: asyncio.Event) -> None:
         efficiency=cfg.charge_efficiency,
         stale_after_s=cfg.soc_stale_after_s,
     ))
+    _load_estimator(hub.est)
     # Shared mutable reference to the active aiomqtt.Client.
     # A list is used so tasks can check/replace it without a closure.
     mqtt_client_ref: list = []

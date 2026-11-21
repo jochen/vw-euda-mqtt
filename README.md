@@ -146,8 +146,23 @@ Copy `.env.example` to `.env`. All variables:
 | `VEHICLE_CAPACITY_KWH` | `58` | Usable battery capacity in kWh (ID.3 Pro = 58) |
 | `SOC_LIVE_SUBTOPIC` | `soc_live` | Subtopic for the interpolated SOC value |
 | `INTERP_INTERVAL_S` | `60` | How often (seconds) to recalculate and publish `soc_live` |
-| `CHARGE_EFFICIENCY` | `1.0` | Charging efficiency factor for interpolation (1.0 matched real data 2026-11-18) |
+| `CHARGE_EFFICIENCY` | `1.0` | Charging efficiency factor for interpolation (real data: 0.98 on 2026-11-18, 0.81 on 2026-11-21; production uses 0.85) |
 | `SOC_STALE_AFTER_S` | `2700` | Stop publishing `soc_live` when the portal has not delivered for this long |
+| `SOC_MANUAL_TOPIC` | `<base>/soc_manual/set` | Manually reported SOC (e.g. from the VW app); becomes the new anchor. Result JSON (retained) on `<base>/soc_manual/result` |
+
+**Manual SOC.** Publish a number (`62`, `62%`, `62,5` or `{"soc": 62}`, *not*
+retained) to `ohm/car/id3/soc_manual/set`. It immediately becomes the anchor for
+`soc_live`; only a *newer* portal reading replaces it. The result
+(`previous_estimate`, measured `efficiency` if ≥ 3 kWh were charged since the
+last anchor) is published retained on `ohm/car/id3/soc_manual/result`;
+calibrations are kept in `euda_estimator.json`.
+
+**Persistence.** Anchor and energy history are saved to `euda_estimator.json`
+every tick, so a restart no longer resets `soc_live` to the last VW value.
+
+**Pinned SOC key.** Three data points are called `battery_state_report.soc`;
+only `506cb83e-…` is the current SOC (the others are "SOC when charging
+started"). See `PINNED_FIELD_KEYS` in `euda/data.py`.
 
 > **Account lockout warning.** The daemon persists its session cookie and only
 > re-authenticates on an explicit 401/403 response. Do **not** wrap it in a
