@@ -37,7 +37,13 @@ def test_old_portal_value_does_not_override_manual():
     e = _est()
     e.manual_reading(50, 1000.0)
     assert e.vw_reading(36, 0.0) is False     # repeated old portal value
-    assert e.vw_reading(52, 2000.0) is True   # genuinely newer report wins
+    # Within the manual lock, VW only confirms or conflicts, never overrides.
+    assert e.vw_reading(52, 2000.0) is False
+    assert e.last_verdict == "confirmed"
+    assert e.vw_reading(60, 3000.0) is False
+    assert e.last_verdict == "conflict"
+    # After the lock (24 h) a newer VW report wins again.
+    assert e.vw_reading(57, 1000.0 + 25 * 3600) is True
 
 
 def test_manual_revives_stale_estimator():

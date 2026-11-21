@@ -68,6 +68,9 @@ MQTT_RECONNECT_DELAY = 10        # seconds (initial backoff on MqttError)
 MQTT_RECONNECT_MAX = 120         # seconds (max backoff)
 MQTT_KEEPALIVE_INTERVAL = 30     # seconds (availability ping — surfaces dead links)
 AVAILABILITY_SUBTOPIC = "availability"
+# evcc site topics (below <evcc base>/site/) that sum up to total consumption.
+SITE_POWER_TOPICS = ("pvPower", "grid/power", "battery/power")
+SITE_MAX_AGE_S = 90              # evcc publishes every ~30 s
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +92,8 @@ class Hub:
     charged_energy_wh: float = 0.0   # current session energy in Wh
 
     last_hv_soc: Optional[float] = None   # last battery_level_HV.value seen
+    # Latest evcc site powers: name → (epoch s, W)
+    site: dict = field(default_factory=dict)
     last_published_soc_live: Optional[float] = None
     stale_logged: bool = False
 
@@ -201,6 +206,19 @@ class Config:
         self.soc_manual_topic = os.environ.get(
             "SOC_MANUAL_TOPIC", f"{self.base_topic}/soc_manual/set")
         self.soc_manual_result_topic = self.soc_manual_topic.rsplit("/", 1)[0] + "/result"
+        # VW values that contradict a trusted anchor are published here
+        # (retained JSON) so e.g. Gaston can ask for the real value.
+        self.soc_conflict_topic = os.environ.get(
+            "SOC_CONFLICT_TOPIC", f"{self.base_topic}/soc_conflict")
+        # Driving between anchor and now: km × consumption is subtracted.
+        self.drive_kwh_per_km = float(os.environ.get("DRIVE_KWH_PER_KM", "0.22"))
+        # Trust rules for VW values (see euda/soc_estimator.py).
+        self.soc_tolerance_pct = float(os.environ.get("SOC_TOLERANCE_PCT", "3"))
+        self.manual_lock_s = float(os.environ.get("MANUAL_LOCK_H", "24")) * 3600.0
+        self.manual_lock_km = float(os.environ.get("MANUAL_LOCK_KM", "30"))
+        # Charge power is capped at measured site consumption minus this.
+        # Negative value disables the cap.
+        self.home_base_load_w = float(os.environ.get("HOME_BASE_LOAD_W", "300"))
         self.interp_interval_s = float(os.environ.get("INTERP_INTERVAL_S", "60"))
         self.charge_efficiency = float(os.environ.get("CHARGE_EFFICIENCY", "1.0"))
         # Withhold soc_live when the portal has not delivered for this long
@@ -372,16 +390,32 @@ async def _poll_once(
 
     # Offer the VW SOC to the estimator. It only re-anchors when the value
     # changed — datasets keep repeating the car's last battery report.
+    hub.est.mileage(_mileage(ds))
     picked = _select_soc(ds, hub)
     if picked is not None:
         new_soc, source = picked
         measured = _reading_time(ds, newest)
-        if hub.est.vw_reading(new_soc, measured):
+        est = hub.est
+        if est.vw_reading(new_soc, measured):
             log.info("Neuer VW-SOC %.0f%% aus %s (gemessen ~%s) → Anker gesetzt",
                      new_soc, source, datetime.fromtimestamp(measured, timezone.utc).isoformat())
-        else:
+        elif est.last_verdict == "repeat":
             log.info("VW-SOC %.0f%% aus %s unverändert (Wiederholung) → Anker bleibt",
                      new_soc, source)
+        elif est.last_verdict == "confirmed":
+            log.info("VW-SOC %.0f%% aus %s passt zum manuellen Anker (Modell %.1f%%) → Anker bleibt",
+                     new_soc, source, est.last_expected)
+        elif est.last_verdict == "conflict":
+            log.warning("VW-SOC %.0f%% aus %s widerspricht dem Modell (%.1f%%, Anker %.0f%% %s) "
+                        "→ verworfen", new_soc, source, est.last_expected, est.vw_soc,
+                        est.anchor_source)
+            if mqtt_client is not None:
+                await mqtt_client.publish(cfg.soc_conflict_topic, json.dumps({
+                    "vw_soc": new_soc, "source": source, "expected": est.last_expected,
+                    "anchor_soc": est.vw_soc, "anchor_source": est.anchor_source,
+                    "measured": datetime.fromtimestamp(measured, timezone.utc).isoformat(),
+                    "time": datetime.now(timezone.utc).isoformat(),
+                }), retain=True)
 
     state["last_dataset"] = newest["name"]
     _save_state(state)
@@ -415,6 +449,19 @@ def _select_soc(ds: Dataset, hub: Hub) -> tuple[float, str] | None:
     if hv_val is not None and hv_val != prev_hv:
         return hv_val, "battery_level_HV (Fallback)"
     return None
+
+
+def _mileage(ds: Dataset) -> float | None:
+    """Highest mileage in the dataset. It appears under several keys with
+    different values (merged reports); the odometer only grows, so max wins."""
+    vals = []
+    for dp in ds.points.values():
+        if dp.field_name == "mileage.value":
+            try:
+                vals.append(float(dp.value))
+            except (TypeError, ValueError):
+                pass
+    return max(vals) if vals else None
 
 
 def _archive_dataset(name: str, payload: dict) -> None:
@@ -473,6 +520,8 @@ async def evcc_listener_task(
         cfg.evcc_topic("connected"): "_on_connected",
         cfg.evcc_topic("chargedEnergy"): "_on_charged_energy",
         cfg.evcc_topic("vehicleSoc"): "_on_vehicle_soc",
+        cfg.evcc_topic("chargePower"): "_on_charge_power",
+        **{f"{evcc_base}/site/{p}": "_on_site_power" for p in SITE_POWER_TOPICS},
     }
 
     backoff = MQTT_RECONNECT_DELAY
@@ -512,6 +561,11 @@ async def evcc_listener_task(
                         await client.publish(cfg.soc_manual_result_topic,
                                              json.dumps(result), retain=True)
                         continue
+                    if message.retain and t != cfg.evcc_topic("connected") \
+                            and t != cfg.evcc_topic("charging"):
+                        # Retained power/energy values may be hours old.
+                        if not t.endswith("/chargedEnergy"):
+                            continue
                     _handle_evcc_message(hub, t, raw, cfg)
 
         except aiomqtt.MqttError as e:
@@ -563,10 +617,42 @@ def _handle_manual_soc(hub: Hub, raw: str) -> dict:
             "time": datetime.fromtimestamp(now, timezone.utc).isoformat()}
 
 
-def _handle_evcc_message(hub: Hub, topic: str, raw: str, cfg: Config) -> None:
+def _site_consumption(hub: Hub, now: float) -> float | None:
+    """PV + grid + battery (evcc signs: grid import +, battery discharge +) =
+    everything the house incl. wallbox draws. None if a value is missing/old
+    (e.g. Fronius Modbus down) — then the charge power is not capped."""
+    total = 0.0
+    for name in SITE_POWER_TOPICS:
+        ts_val = hub.site.get(name)
+        if ts_val is None or now - ts_val[0] > SITE_MAX_AGE_S:
+            return None
+        total += ts_val[1]
+    return total
+
+
+def _handle_evcc_message(hub: Hub, topic: str, raw: str, cfg: Config,
+                         now: float | None = None) -> None:
     """Parse one evcc MQTT message and update hub state."""
     lp = cfg.evcc_loadpoint
     suffix = topic.split(f"/loadpoints/{lp}/", 1)[-1] if f"/loadpoints/{lp}/" in topic else ""
+    now = time.time() if now is None else now
+
+    site_prefix = f"{cfg.evcc_base_topic}/site/"
+    if topic.startswith(site_prefix) and topic[len(site_prefix):] in SITE_POWER_TOPICS:
+        try:
+            hub.site[topic[len(site_prefix):]] = (now, float(raw))
+        except ValueError:
+            pass
+        return
+
+    if suffix == "chargePower":
+        # evcc publishes every cycle (~30 s): one integration step per message.
+        try:
+            charge_w = float(raw)
+        except ValueError:
+            return
+        hub.est.site_power(now, charge_w, _site_consumption(hub, now))
+        return
 
     if suffix == "charging":
         hub.charging = raw.lower() == "true"
@@ -583,7 +669,7 @@ def _handle_evcc_message(hub: Hub, topic: str, raw: str, cfg: Config) -> None:
             log.warning("chargedEnergy: ungültiger Wert %r", raw)
             return
         hub.charged_energy_wh = new_energy
-        hub.est.evcc_energy(time.time(), new_energy)
+        hub.est.evcc_energy(now, new_energy)
         log.debug("evcc chargedEnergy: %.0f Wh", new_energy)
 
     elif suffix == "vehicleSoc":
@@ -658,10 +744,12 @@ async def interpolation_task(
             hub.last_published_soc_live = rounded
             log.log(
                 logging.INFO if changed else logging.DEBUG,
-                "soc_live=%.1f%% (charging=%s, vw_soc=%s, session=%.0f Wh)",
+                "soc_live=%.1f%% (charging=%s, anker=%s %s, session=%.0f Wh, "
+                "davon nicht gemessen %.0f Wh, gefahren %s km)",
                 rounded, hub.charging,
                 f"{hub.est.vw_soc:.0f}%" if hub.est.vw_soc is not None else "None",
-                hub.charged_energy_wh,
+                hub.est.anchor_source, hub.charged_energy_wh, hub.est.phantom_wh,
+                hub.est.km_since_anchor(),
             )
         except aiomqtt.MqttError as e:
             log.warning("interpolation: Publish-Fehler: %s", e)
@@ -745,6 +833,11 @@ async def run(cfg: Config, stop: asyncio.Event) -> None:
         capacity_kwh=cfg.vehicle_capacity_kwh,
         efficiency=cfg.charge_efficiency,
         stale_after_s=cfg.soc_stale_after_s,
+        drive_kwh_per_km=cfg.drive_kwh_per_km,
+        tolerance_pct=cfg.soc_tolerance_pct,
+        manual_lock_s=cfg.manual_lock_s,
+        manual_lock_km=cfg.manual_lock_km,
+        home_base_w=cfg.home_base_load_w,
     ))
     _load_estimator(hub.est)
     # Shared mutable reference to the active aiomqtt.Client.

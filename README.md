@@ -243,6 +243,31 @@ vehicles:
 No extra publishing is required — MQTT is pub/sub and the daemon already
 publishes the topic.
 
+### Start value, trust rules and measured cap (since 2026-11-21)
+
+`soc_live = anchor + charged × CHARGE_EFFICIENCY − km since anchor × DRIVE_KWH_PER_KM`
+
+- **Driving.** The portal SOC often lags 12–24 h, but `mileage.value` comes in
+  almost every dataset. Driving since the anchor is subtracted, so a SOC
+  reported at unplug (manual, e.g. via Gaston) is still a good start value at
+  the next plug-in. Pure-driving intervals ≥ 10 km between two anchors are
+  logged as consumption samples (`drive_calibrations` in the state file).
+- **Trust.** A manual SOC locks the anchor for `MANUAL_LOCK_H` (24 h) or until
+  `MANUAL_LOCK_KM` (30 km) are driven. In that window VW values only *confirm*
+  (within `SOC_TOLERANCE_PCT`) or *conflict* — they never replace it. Outside
+  the lock, a VW value more than the tolerance **below** the model after
+  charging, with the car not moved, is a stale pre-charge report and is
+  rejected. Conflicts are published retained as JSON on
+  `ohm/car/id3/soc_conflict` (`SOC_CONFLICT_TOPIC`), e.g. for Gaston to ask
+  for the app value.
+- **Measured cap.** The Elli Connect reports no measurements over EEBUS; evcc's
+  `chargePower` is offered current × 230 V × phases and keeps counting when the
+  car stops drawing. The service caps it at the measured site consumption
+  (evcc `site/pvPower + grid/power + battery/power`, i.e. the Fronius) minus
+  `HOME_BASE_LOAD_W` and subtracts the excess from the session energy. Without
+  fresh site values (e.g. Modbus down) nothing is capped. A real meter in the
+  wallbox supply would make this unnecessary.
+
 ---
 
 ## License
