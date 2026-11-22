@@ -390,11 +390,11 @@ async def _poll_once(
 
     # Offer the VW SOC to the estimator. It only re-anchors when the value
     # changed — datasets keep repeating the car's last battery report.
-    hub.est.mileage(_mileage(ds))
+    measured = _reading_time(ds, newest)
+    hub.est.mileage(_mileage(ds), measured)
     picked = _select_soc(ds, hub)
     if picked is not None:
         new_soc, source = picked
-        measured = _reading_time(ds, newest)
         est = hub.est
         if est.vw_reading(new_soc, measured):
             log.info("Neuer VW-SOC %.0f%% aus %s (gemessen ~%s) → Anker gesetzt",

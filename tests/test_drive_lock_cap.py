@@ -170,3 +170,21 @@ def test_legacy_state_detects_manual_anchor():
     b.load_dict({"vw_soc": 71.0, "vw_soc_time": 5.0, "last_portal_ok": 5.0,
                  "calibrations": [{"ts": 5.0, "efficiency": 1.0}], "energy": {}})
     assert b.anchor_source == "manual"
+
+
+def test_late_mileage_from_before_manual_anchor_is_not_driving():
+    # 21.11.: 71 % manual at 14:01, out 24 km (VW knew), return 24 km (VW late).
+    # 48 % manual at 23:07; +24 km arrives 00:11 in a dataset captured 21:10.
+    e = _est(drive_kwh_per_km=0.22)
+    e.mileage(72885, 0.0)
+    e.manual_reading(71, 14 * H)
+    e.mileage(72909, 17 * H)
+    e.manual_reading(48, 23 * H)
+    assert e.drive_calibrations == []           # manual: mileage may lag
+    e.mileage(72933, 21 * H)                    # captured before the anchor
+    e.portal_ok(24 * H)
+    assert e.anchor_km == 72933
+    assert e.estimate(24 * H) == pytest.approx(48.0)
+    e.mileage(72943, 25 * H)                    # real driving after the anchor
+    e.portal_ok(25 * H)
+    assert e.estimate(25 * H) == pytest.approx(48.0 - 10 * 0.22 / 58 * 100)

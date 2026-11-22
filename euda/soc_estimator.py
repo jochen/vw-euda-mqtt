@@ -178,15 +178,30 @@ class SocEstimator:
     def portal_ok(self, ts: float) -> None:
         self.last_portal_ok = ts
 
-    def mileage(self, km: Optional[float]) -> None:
-        """Feed the highest mileage of a dataset (km, monotonic)."""
+    def mileage(self, km: Optional[float], measured_at: Optional[float] = None) -> None:
+        """Feed the highest mileage of a dataset (km, monotonic).
+
+        ``measured_at`` is the dataset's newest car capture time. Mileage
+        measured *before* the anchor is already contained in the anchor SOC and
+        moves ``anchor_km`` instead of counting as driving. Incident 21.11.:
+        48 % reported at 23:07 after a round trip; the return leg's +24 km came
+        at 00:11 (captured 21:10) and was subtracted again → 38.9 %.
+        """
         if km is None:
             return
+        km = float(km)
         if self.km is None or km > self.km:
-            self.km = float(km)
+            self.km = km
         if self.anchor_km is None and self.vw_soc is not None:
             # Anchor from before mileage was tracked: assume no driving yet.
             self.anchor_km = self.km
+        elif (measured_at is not None and self.vw_soc_time is not None
+              and self.anchor_km is not None and measured_at <= self.vw_soc_time
+              and km > self.anchor_km):
+            log.info("Kilometerstand %.0f gemessen vor dem Anker (%s) → im Anker enthalten, "
+                     "nicht als Fahrt abgezogen (+%.0f km)", km, self.anchor_source,
+                     km - self.anchor_km)
+            self.anchor_km = km
 
     def _locked(self, ts: float) -> bool:
         if self.anchor_source != "manual" or self.vw_soc_time is None:
@@ -196,7 +211,10 @@ class SocEstimator:
         return (self.km_since_anchor() or 0.0) < self.manual_lock_km
 
     def _set_anchor(self, soc: float, ts: float, source: str) -> None:
-        self._drive_calibration(soc, ts)
+        if source == "vw":
+            # A manual value may come before the trip's mileage has arrived
+            # (21.11.: "0.556 kWh/km") — only VW values carry their own mileage.
+            self._drive_calibration(soc, ts)
         self.vw_soc = float(soc)
         self.vw_soc_time = ts
         self.anchor_source = source
