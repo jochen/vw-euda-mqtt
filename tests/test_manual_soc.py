@@ -72,3 +72,27 @@ def test_calibrations_persist():
     f = SocEstimator()
     f.load_dict(e.to_dict())
     assert f.calibrations == e.calibrations
+
+
+def test_implausible_efficiency_is_not_kept():
+    # 24.11.: 26 % + 12 kWh, then driven (mileage not yet delivered) -> 36 %.
+    e = SocEstimator(capacity_kwh=58.0, efficiency=0.98, stale_after_s=2700)
+    e.portal_ok(0.0)
+    e.evcc_energy(0.0, 0.0)
+    e.vw_reading(26, 0.0)
+    e.evcc_energy(3600.0, 12043.0)
+    r = e.manual_reading(36, 3700.0)
+    assert r["efficiency"] == pytest.approx(0.482, abs=0.001)
+    assert "calibration_rejected" in r
+    assert e.calibrations == []
+    assert e.vw_soc == 36                   # still becomes the anchor
+
+
+def test_no_calibration_after_known_driving():
+    e = _est()
+    e.mileage(1000.0, 0.0)
+    e.evcc_energy(3600.0, 9984.0)
+    e.mileage(1020.0, 3650.0)
+    r = e.manual_reading(50, 3700.0)
+    assert "km" in r["calibration_rejected"]
+    assert e.calibrations == []

@@ -56,6 +56,11 @@ HISTORY_KEEP_S = 48 * 3600
 # Below this, 1 % SOC rounding dominates the efficiency estimate.
 MIN_CALIBRATION_WH = 3000.0
 MAX_CALIBRATIONS = 30
+# AC charging efficiency outside this band means something else changed the
+# SOC (unreported driving, preconditioning) -- such a sample is not kept.
+# Incident 24.11.: drove in the morning, mileage not yet delivered -> 0.48.
+CALIBRATION_EFF_MIN = 0.75
+CALIBRATION_EFF_MAX = 1.10
 # Drive-consumption samples need some distance to be meaningful.
 MIN_DRIVE_CALIBRATION_KM = 10.0
 # Longer gaps between site power samples are not integrated (data outage).
@@ -317,6 +322,17 @@ class SocEstimator:
             if delta_wh >= MIN_CALIBRATION_WH and soc > self.vw_soc:
                 eff = (soc - self.vw_soc) / 100.0 * self.capacity_kwh * 1000.0 / delta_wh
                 result["efficiency"] = round(eff, 3)
+                driven = self.km_since_anchor()
+                reason = None
+                if driven:
+                    reason = f"{driven:.0f} km gefahren seit Anker"
+                elif not CALIBRATION_EFF_MIN <= eff <= CALIBRATION_EFF_MAX:
+                    reason = (f"Effizienz {eff:.3f} außerhalb "
+                              f"{CALIBRATION_EFF_MIN}-{CALIBRATION_EFF_MAX}")
+                if reason:
+                    result["calibration_rejected"] = reason
+                    log.warning("Kalibrierung verworfen: %s (vermutlich Fahrt/Vorheizen)", reason)
+            if result["efficiency"] is not None and "calibration_rejected" not in result:
                 self.calibrations.append({"ts": ts, "from_soc": self.vw_soc, "to_soc": float(soc),
                                           "delta_wh": round(delta_wh), "efficiency": round(eff, 3)})
                 del self.calibrations[:-MAX_CALIBRATIONS]
